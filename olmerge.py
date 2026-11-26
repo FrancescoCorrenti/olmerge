@@ -135,7 +135,16 @@ class Overleaf:
                           "qqfile": (f"{name}.zip", zipped, "application/zip")},
                    headers={"x-csrf-token": token, "Accept": "application/json", "Referer": f"https://{self.host}/project"})
         r.raise_for_status()
-        return r.json()["project_id"]
+        pid = r.json()["project_id"]
+        self.rename(pid, name)                                     # Overleaf names an upload after its \title
+        return pid
+
+    def rename(self, pid, name):
+        s = self.api._get_session()                                # pylint: disable=protected-access
+        r = s.post(f"https://{self.host}/project/{pid}/rename", json={"newProjectName": name},
+                   headers={"x-csrf-token": self.api._get_csrf_token(pid), "Accept": "application/json",  # pylint: disable=protected-access
+                            "Referer": f"https://{self.host}/project/{pid}"})
+        r.raise_for_status()
 
 
 class OTError(RuntimeError):
@@ -151,6 +160,8 @@ class Channel:
     def recv(self):
         while True:
             m = self.ws.recv()
+            if os.environ.get("OLMERGE_DEBUG"):
+                print("  <<", m[:200])
             if m.startswith("2::"):                                # heartbeat
                 self.ws.send("2::")
             elif m.startswith("7:") or m.startswith("0::"):
@@ -165,11 +176,11 @@ class Channel:
     def call(self, name, args):
         self.n += 1
         self.ws.send(f"5:{self.n}+::" + json.dumps({"name": name, "args": args}))
-        tag = f"6:::{self.n}+"
+        tag = f"6:::{self.n}"                                      # ack: "6:::n" or "6:::n+[args]"
         while True:
             m = self.recv()
-            if m.startswith(tag):
-                res = json.loads(m[len(tag):])
+            if m == tag or m.startswith(tag + "+"):
+                res = json.loads(m[len(tag) + 1:] or "[]")
                 if res and res[0]:
                     raise OTError(f"{name}: {res[0]}")
                 return res
@@ -285,7 +296,13 @@ def sync(repo, overleaf, dry_run=False):
             print("Overleaf changed during the sync, starting over"); continue
         files = {p: subprocess.run(["git", "show", f"HEAD:{p}"], cwd=repo.root, capture_output=True, check=True).stdout
                  for p, s in todo if s != "D"}
-        overleaf.upload(pid, files, [p for p, s in todo if s == "D"])
+        try:
+            overleaf.upload(pid, files, [p for p, s in todo if s == "D"])
+        except Exception as e:                                     # pylint: disable=broad-except
+            # what already reached Overleaf is recorded on `overleaf`: it equals the local version, so the next
+            # sync merges it cleanly instead of mistaking it for a co-author's edit
+            snapshot(repo, {p: d for p, d in overleaf.download(pid).items() if repo.synced(p)})
+            sys.exit(f"olmerge: push interrupted ({type(e).__name__}: {e}); run sync again")
         repo.git("update-ref", f"refs/heads/{BRANCH}", repo.git("rev-parse", "HEAD"))
         print("pushed: Overleaf now matches", repo.git("rev-parse", "--short", "HEAD")); return
     sys.exit("olmerge: Overleaf kept changing during the sync; try again in a minute")
