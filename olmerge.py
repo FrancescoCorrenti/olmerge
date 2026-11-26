@@ -65,6 +65,26 @@ class Overleaf:
             sys.exit("olmerge: no Overleaf session; run `olmerge login`")
         self.host, self.api = host, pyoverleaf.Api(host=host)
         self.api.login_from_cookies({"overleaf_session2": cookie})
+        self.edit_mode, self.track = "ot", False                   # "upload": replace files (comments are lost)
+
+    def edit_doc(self, pid, doc_id, new):
+        """Turn the doc on Overleaf into `new` with in-place edits (the editor's real-time channel), so that comments
+        and tracked changes anchored to unchanged text survive -> number of edits."""
+        ch = Channel(self.api._open_socket(pid))                   # pylint: disable=protected-access
+        try:
+            ch.wait_joined()
+            lines, version = ch.call("joinDoc", [doc_id, {"encodeRanges": True}])[1:3]
+            old = "\n".join(_decode(l) for l in lines)
+            op = text_op(old, new)
+            if op:
+                upd = {"doc": doc_id, "op": op, "v": version}
+                if self.track:
+                    upd["meta"] = {"tc": os.urandom(12).hex()}
+                ch.call("applyOtUpdate", [doc_id, upd])
+            ch.call("leaveDoc", [doc_id])
+            return len(op)
+        finally:
+            ch.close()
 
     def projects(self):
         return self.api.get_projects()
@@ -89,6 +109,13 @@ class Overleaf:
             if p in entities:
                 self.api.project_delete_entity(pid, entities[p]); print("  deleted ", p)
         for p, data in files.items():
+            ent = entities.get(p)
+            if ent is not None and ent.type == "doc" and self.edit_mode == "ot":
+                try:                                               # edit in place: comments and tracked changes survive
+                    n = self.edit_doc(pid, ent.id, data.decode("utf-8"))
+                    print("  edited  ", p, f"({n} change{'s' * (n != 1)})"); continue
+                except (OTError, UnicodeDecodeError) as e:
+                    print(f"  could not edit {p} in place ({e}); replacing the file, its comments are lost")
             parent = ""
             for part in p.split("/")[:-1]:
                 q = f"{parent}/{part}" if parent else part
@@ -109,6 +136,101 @@ class Overleaf:
                    headers={"x-csrf-token": token, "Accept": "application/json", "Referer": f"https://{self.host}/project"})
         r.raise_for_status()
         return r.json()["project_id"]
+
+
+class OTError(RuntimeError):
+    pass
+
+
+class Channel:
+    """Minimal socket.io 0.9 client over pyoverleaf's websocket: numbered calls with acknowledgements, heartbeats."""
+
+    def __init__(self, ws):
+        self.ws, self.n = ws, 0
+
+    def recv(self):
+        while True:
+            m = self.ws.recv()
+            if m.startswith("2::"):                                # heartbeat
+                self.ws.send("2::")
+            elif m.startswith("7:") or m.startswith("0::"):
+                raise OTError(f"channel closed: {m[:120]}")
+            else:
+                return m
+
+    def wait_joined(self):
+        while not self.recv().startswith("5:"):                    # joinProjectResponse (or connectionAccepted)
+            pass
+
+    def call(self, name, args):
+        self.n += 1
+        self.ws.send(f"5:{self.n}+::" + json.dumps({"name": name, "args": args}))
+        tag = f"6:::{self.n}+"
+        while True:
+            m = self.recv()
+            if m.startswith(tag):
+                res = json.loads(m[len(tag):])
+                if res and res[0]:
+                    raise OTError(f"{name}: {res[0]}")
+                return res
+
+    def close(self):
+        try:
+            self.ws.close()
+        except Exception:                                          # pylint: disable=broad-except
+            pass
+
+
+def _decode(line):
+    """joinDoc with encodeRanges sends each line as its UTF-8 bytes in a binary string."""
+    try:
+        return line.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return line
+
+
+def text_op(old, new):
+    """ShareJS text op turning `old` into `new`: delete/insert components, positions in UTF-16 code units (as in the
+    browser). Lines are matched first, characters only inside changed blocks, so edits stay small and local; the
+    components run from the end of the document backwards, so each position refers to the original text."""
+    import difflib
+    u16 = lambda s: len(s.encode("utf-16-le")) // 2
+    import re
+    lines = lambda s: re.findall(r"[^\n]*\n|[^\n]+", s)           # each line keeps its newline; only \n splits
+    ol, nl = lines(old), lines(new)
+    starts = [0]
+    for line in ol:
+        starts.append(starts[-1] + len(line))                      # starts[len(ol)] == len(old)
+    edits = []                                                     # (char offset in old, deleted text, inserted text)
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, ol, nl, autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        a, b, base = "".join(ol[i1:i2]), "".join(nl[j1:j2]), starts[i1]
+        for t, k1, k2, l1, l2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+            if t != "equal":
+                edits.append((base + k1, a[k1:k2], b[l1:l2]))
+    op = []
+    for off, d, i in sorted(edits, reverse=True):
+        p = u16(old[:off])
+        if d:
+            op.append({"p": p, "d": d})
+        if i:
+            op.append({"p": p, "i": i})
+    return op
+
+
+def apply_op(text, op):
+    """Apply a text_op (UTF-16 positions) to a Python string: the reference used by the tests."""
+    b = text.encode("utf-16-le")
+    for c in op:
+        p = c["p"] * 2
+        if "d" in c:
+            d = c["d"].encode("utf-16-le")
+            assert b[p:p + len(d)] == d, ("delete does not match", c)
+            b = b[:p] + b[p + len(d):]
+        else:
+            b = b[:p] + c["i"].encode("utf-16-le") + b[p:]
+    return b.decode("utf-16-le")
 
 
 def _keyring():
@@ -200,6 +322,7 @@ def main(argv=None):
         return
     repo = Repo()
     ol = Overleaf(repo.cfg.get("host", "www.overleaf.com"))
+    ol.edit_mode, ol.track = repo.cfg.get("edit", "ot"), bool(repo.cfg.get("track_changes", False))
     if a.cmd == "create":
         prepare(repo)
         buf = io.BytesIO()

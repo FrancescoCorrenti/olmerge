@@ -63,6 +63,36 @@ def test_merge_push_and_conflict():
     assert ol.files == before
 
 
+def test_text_op_random_edits():
+    """The in-place edit turns the old doc into the new one, positions in UTF-16 (accents, emoji, empty lines)."""
+    import random
+    rng = random.Random(0)
+    alphabet = ["a", "b", " ", "\n", "\\", "{", "}", "è", "Δ", "😀", "\n\n"]
+    for _ in range(500):
+        old = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 60)))
+        new = list(old)
+        for _ in range(rng.randint(0, 6)):
+            k = rng.randint(0, len(new))
+            if rng.random() < 0.5 and k < len(new):
+                del new[k:k + rng.randint(1, 5)]
+            else:
+                new[k:k] = rng.choice(alphabet) * rng.randint(1, 3)
+        new = "".join(new)
+        op = olmerge.text_op(old, new)
+        assert olmerge.apply_op(old, op) == new, (old, new, op)
+        assert (op == []) == (old == new)
+
+
+def test_text_op_is_local():
+    """Changing one word in a long doc touches only that word, so comments elsewhere keep their anchors."""
+    old = "".join(f"line {k} of the paper\n" for k in range(200))
+    new = old.replace("line 100 of", "line 100 in")
+    op = olmerge.text_op(old, new)
+    assert sum(len(c.get("d", "")) + len(c.get("i", "")) for c in op) <= 4, op
+
+
 if __name__ == "__main__":
+    test_text_op_random_edits()
+    test_text_op_is_local()
     test_merge_push_and_conflict()
     print("ok")

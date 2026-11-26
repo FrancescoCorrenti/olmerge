@@ -2,6 +2,9 @@
 
 **Work on your Overleaf paper locally, with git, and merge with your co-authors' edits on Overleaf. On any Overleaf plan.**
 
+> **Status: 0.1, early.** The merge logic and the in-place edits are covered by tests against a simulated Overleaf;
+> real-world use is just starting. Keep your work committed, and please open an issue if something goes wrong.
+
 Overleaf's git integration is a paid feature. `olmerge` gives you the part that matters on the free plan too: a real
 git three-way merge between your local repository and the Overleaf project, in one command.
 
@@ -39,8 +42,12 @@ flowchart LR
   again.
 * Before uploading, `olmerge` downloads the project once more. If a co-author typed something in the meantime, it
   starts over instead of overwriting their edit.
-* Only files that differ are uploaded. Folders are created as needed, and files you deleted locally are deleted on
-  Overleaf.
+* **Comments and tracked changes survive.** Text files that already exist on Overleaf are not replaced: `olmerge`
+  opens them through the editor's real-time channel and applies only your edits, character by character, as if you
+  had typed them in the browser. Comments and tracked changes anchored to text you did not change stay where they
+  are, and Overleaf's history shows your edits as yours.
+* New files and binary files (figures, PDFs) are uploaded. Folders are created as needed, and files you deleted
+  locally are deleted on Overleaf.
 
 Under the hood `olmerge` uses [pyoverleaf](https://github.com/jkulhanek/pyoverleaf), which talks to the same web
 endpoints as the Overleaf editor.
@@ -97,7 +104,9 @@ The binding lives in `.overleaf.json` at the top of the repository:
 {
  "project_id": "0123456789abcdef01234567",
  "exclude": ["notes/", "data/"],
- "host": "www.overleaf.com"
+ "host": "www.overleaf.com",
+ "edit": "ot",
+ "track_changes": false
 }
 ```
 
@@ -105,6 +114,9 @@ The binding lives in `.overleaf.json` at the top of the repository:
   `.overleaf.json`, `.gitignore`, `.gitattributes`, `latexmkrc`, `.latexmkrc` (a local `latexmkrc` often contains
   settings, like an output folder, that would break Overleaf's compiler).
 * `host`: for a self-hosted Overleaf (Community or Server Pro).
+* `edit`: `"ot"` (default) edits existing text files in place; `"upload"` replaces them (simpler, but comments and
+  tracked changes on the files you changed are lost).
+* `track_changes`: `true` sends your edits as tracked changes, for your co-authors to accept or reject.
 
 `create` and `bind` also set the repository to LF line endings (`.gitattributes`, `core.autocrlf false`), because
 Overleaf stores LF: otherwise on Windows every file would look modified at every sync.
@@ -122,9 +134,9 @@ Add a task to `.vscode/tasks.json` and run it with *Ctrl+Shift+P, Run Task*:
 
 ## Good to know
 
-* **Comments and tracked changes.** When `olmerge` uploads a file, Overleaf replaces that document. Comments and
-  tracked changes attached to a file you edited locally are lost on Overleaf (they never existed in your local
-  copy). Files you did not touch keep theirs. The previous version stays in Overleaf's history.
+* **Comments on deleted text.** A comment disappears if you delete, locally, the very text it is attached to, exactly
+  as in the browser. If an in-place edit fails, `olmerge` falls back to replacing the file and says so: that file's
+  comments are then lost on Overleaf (the previous version stays in its history).
 * **Unofficial endpoints.** Overleaf does not offer a public API for this; `olmerge` uses the endpoints of its web
   editor. If Overleaf changes them, `olmerge` may break until pyoverleaf is updated. The pyoverleaf version is pinned
   for this reason.
